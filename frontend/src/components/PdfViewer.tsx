@@ -67,7 +67,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ file }) => {
     setLoadError(null);
   };
 
-  const zoomIn  = () => setScale(s => Math.min(3, parseFloat((s + 0.15).toFixed(2))));
+  const zoomIn = () => setScale(s => Math.min(3, parseFloat((s + 0.15).toFixed(2))));
   const zoomOut = () => setScale(s => Math.max(0.4, parseFloat((s - 0.15).toFixed(2))));
   const zoomReset = () => { setScale(1.0); setFitMode('width'); };
 
@@ -173,9 +173,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ file }) => {
                     const renderedW = effectiveWidth;
                     const renderedH = renderedW * (pageDimensions.height / pageDimensions.width);
 
-                    const left   = (x0 / pageDimensions.width)  * renderedW;
-                    const top    = (y0 / pageDimensions.height) * renderedH;
-                    const width  = ((x1 - x0) / pageDimensions.width)  * renderedW;
+                    const left = (x0 / pageDimensions.width) * renderedW;
+                    const top = (y0 / pageDimensions.height) * renderedH;
+                    const width = ((x1 - x0) / pageDimensions.width) * renderedW;
                     const height = ((y1 - y0) / pageDimensions.height) * renderedH;
 
                     const isSelected = selectedAssetId === det.id;
@@ -185,11 +185,10 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ file }) => {
                       <div
                         key={det.id}
                         onClick={(e) => { e.stopPropagation(); handleBoxClick(det.id); }}
-                        className={`absolute cursor-pointer pointer-events-auto transition-all duration-200 ${
-                          isSelected
-                            ? 'bbox-selected'
-                            : isTable ? 'bbox-table' : 'bbox-figure'
-                        }`}
+                        className={`absolute cursor-pointer pointer-events-auto transition-all duration-200 ${isSelected
+                          ? 'bbox-selected'
+                          : isTable ? 'bbox-table' : 'bbox-figure'
+                          }`}
                         style={{ left, top, width, height }}
                         title={det.caption || det.figure_no || 'Visual Asset'}
                       >
