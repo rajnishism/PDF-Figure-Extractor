@@ -1,0 +1,35 @@
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Runtime data (never commit generated files) ──────────────────
+backend/assets/
+backend/uploads/
+
+# ── Node / Frontend ──────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.local
+
+# ── OS & Editor ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Logs ─────────────────────────────────────────────────────────
+*.log
+npm-debug.log*

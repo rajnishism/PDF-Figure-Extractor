@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+pymupdf
+opencv-python
+layoutparser
+paddleocr
+paddlepaddle
+pillow
+numpy
+python-dotenv
+ImageHash
