@@ -10,6 +10,7 @@ import {
   Tag,
   Download,
   Loader2,
+  ExternalLink,
 } from 'lucide-react';
 import PdfViewer from './components/PdfViewer';
 import AssetList from './components/AssetList';
@@ -269,6 +270,17 @@ const App: React.FC = () => {
                 {filename}
               </span>
             </div>
+
+            {/* API Docs Link */}
+            <a 
+              href={`${API_BASE}/docs`} 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="docs-link"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              API Docs
+            </a>
 
             {/* Export */}
             <button
