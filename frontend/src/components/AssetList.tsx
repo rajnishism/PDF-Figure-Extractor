@@ -1,21 +1,61 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useStore } from '../store/useStore';
-import { Download, ExternalLink, Tag, Info, Copy } from 'lucide-react';
+import { Download, Tag, Info, Copy, Eye } from 'lucide-react';
+import AssetPreviewModal from './AssetPreviewModal';
 
-const AssetList: React.FC = () => {
-  const { detections, selectedAssetId, setSelectedAssetId } = useStore();
+interface AssetListProps {
+  onFetchPage: (page: number) => Promise<void>;
+  onNavigateToPage: (page: number) => void;
+}
 
-  const handleDownload = (url: string, filename: string) => {
-    const link = document.createElement('a');
-    link.href = `http://localhost:8001${url}`;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+const AssetList: React.FC<AssetListProps> = ({ onFetchPage, onNavigateToPage }) => {
+  const {
+    detections,
+    detectionsByPage,
+    selectedAssetId,
+    setSelectedAssetId,
+    totalPages,
+    getAllDetections,
+  } = useStore();
+
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+
+  // All detections across ALL processed pages (sorted by page)
+  const allDetections = getAllDetections();
+
+  // Pages that have been processed
+  const processedPages = new Set(Object.keys(detectionsByPage).map(Number));
+
+  const handleDownload = async (url: string, filename: string) => {
+    try {
+      const resp = await fetch(`http://localhost:8001${url}`);
+      const blob = await resp.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(objectUrl);
+    } catch (e) {
+      console.error('Download failed', e);
+    }
   };
 
   const handleCopyCaption = (caption: string) => {
     navigator.clipboard.writeText(caption).catch(() => {});
+  };
+
+  /**
+   * When opening preview from a current-page asset card,
+   * find its index in the GLOBAL allDetections list so the modal
+   * correctly positions within the full cross-page list.
+   */
+  const openPreview = (assetId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const globalIndex = allDetections.findIndex(d => d.id === assetId);
+    setPreviewIndex(globalIndex >= 0 ? globalIndex : 0);
   };
 
   if (detections.length === 0) {
@@ -51,10 +91,17 @@ const AssetList: React.FC = () => {
           <Tag className="w-4 h-4" style={{ color: '#818cf8' }} />
           Extracted Assets
         </h2>
-        <span className="badge">{detections.length} found</span>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span className="badge">{detections.length} this page</span>
+          {allDetections.length > detections.length && (
+            <span className="badge" style={{ background: 'rgba(99,102,241,0.12)', color: '#818cf8', borderColor: 'rgba(99,102,241,0.2)' }}>
+              {allDetections.length} total
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* Scrollable list */}
+      {/* Scrollable list — shows current page assets */}
       <div className="asset-list">
         {detections.map((asset, idx) => (
           <div
@@ -64,23 +111,17 @@ const AssetList: React.FC = () => {
             className={`asset-card fade-in ${selectedAssetId === asset.id ? 'selected' : ''}`}
             style={{ animationDelay: `${idx * 50}ms` }}
           >
-            {/* Thumbnail */}
-            <div className="asset-thumbnail">
+            {/* Thumbnail — click opens lightbox */}
+            <div className="asset-thumbnail" onClick={e => openPreview(asset.id, e)}>
               <img
                 src={`http://localhost:8001${asset.image_url}`}
                 alt={asset.caption || 'Extracted asset'}
                 loading="lazy"
               />
               <div className="thumbnail-overlay">
-                <button
-                  className="icon-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    window.open(`http://localhost:8001${asset.image_url}`, '_blank');
-                  }}
-                  title="Open in new tab"
-                >
-                  <ExternalLink className="w-4 h-4" />
+                <button className="icon-btn preview-trigger-btn" title="Preview">
+                  <Eye className="w-4 h-4" />
+                  <span style={{ fontSize: 10, fontWeight: 600, marginLeft: 4 }}>Preview</span>
                 </button>
               </div>
             </div>
@@ -128,7 +169,7 @@ const AssetList: React.FC = () => {
             <div className="asset-actions">
               <button
                 className="btn-download"
-                onClick={(e) => {
+                onClick={e => {
                   e.stopPropagation();
                   handleDownload(asset.image_url, `${asset.figure_no || asset.id}.png`);
                 }}
@@ -138,18 +179,35 @@ const AssetList: React.FC = () => {
               </button>
               <button
                 className="btn-icon-sm"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleCopyCaption(asset.caption || '');
-                }}
+                onClick={e => { e.stopPropagation(); handleCopyCaption(asset.caption || ''); }}
                 title="Copy caption"
               >
                 <Copy className="w-3.5 h-3.5" />
+              </button>
+              <button
+                className="btn-icon-sm"
+                onClick={e => openPreview(asset.id, e)}
+                title="Full preview (all pages)"
+              >
+                <Eye className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
         ))}
       </div>
+
+      {/* Preview modal — operates on ALL accumulated detections across pages */}
+      {previewIndex !== null && (
+        <AssetPreviewModal
+          assets={allDetections}
+          initialIndex={previewIndex}
+          onClose={() => setPreviewIndex(null)}
+          totalPages={totalPages}
+          processedPages={processedPages}
+          onFetchPage={onFetchPage}
+          onNavigateToPage={onNavigateToPage}
+        />
+      )}
     </>
   );
 };

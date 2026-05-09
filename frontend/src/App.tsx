@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import {
   Upload,
@@ -15,6 +15,7 @@ import {
 import PdfViewer from './components/PdfViewer';
 import AssetList from './components/AssetList';
 import { useStore } from './store/useStore';
+import type { Detection } from './store/useStore';
 
 const API_BASE = 'http://localhost:8001';
 
@@ -23,20 +24,83 @@ const App: React.FC = () => {
     sessionId,
     totalPages,
     currentPage,
+    detectionsByPage,
+    pageDimensions,
     setSession,
     setCurrentPage,
     setDetections,
+    addPageToCache,
+    isPageInCache,
     isLoading,
     setLoading,
   } = useStore();
 
   const [file, setFile] = useState<File | null>(null);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null); // URL for restored sessions
   const [isUploading, setIsUploading] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [filename, setFilename] = useState('');
   const [assetPanelWidth, setAssetPanelWidth] = useState(380);
   const [isResizing, setIsResizing] = useState(false);
   const [exportProgress, setExportProgress] = useState<{ current: number; total: number; status: string } | null>(null);
+  const [backgroundProgress, setBackgroundProgress] = useState<{ current: number; total: number; status: string } | null>(null);
+
+  // ── Session Restore on Mount ──────────────────────────────────────────────
+  useEffect(() => {
+    const saved = localStorage.getItem('visionextract_session');
+    if (!saved) return;
+
+    let parsed: { sessionId: string; filename: string; totalPages: number; currentPage: number };
+    try { parsed = JSON.parse(saved); } catch { return; }
+
+    const { sessionId: sid, filename: fname, totalPages: tp, currentPage: cp } = parsed;
+    if (!sid) return;
+
+    setIsRestoring(true);
+    // Verify the backend still has this session
+    axios.get(`${API_BASE}/session/${sid}`)
+      .then(async (res) => {
+        const data = res.data;
+        // Restore store state
+        setSession(sid, data.total_pages);
+        setFilename(fname || data.filename);
+        // PdfViewer will load via URL instead of File object
+        setPdfUrl(`${API_BASE}/pdf/${sid}`);
+        // Restore page position
+        const page = Math.min(cp || 1, data.total_pages);
+        setCurrentPage(page);
+        // Re-fetch detections for the restored current page
+        await processCurrentPage(sid, page);
+        // Pre-populate cache for all already-processed pages
+        for (const p of data.cached_pages) {
+          if (!isPageInCache(p)) {
+            try {
+              const r = await axios.get(`${API_BASE}/process-page/${sid}/${p}`);
+              addPageToCache(p, r.data.detections);
+            } catch { /* best-effort */ }
+          }
+        }
+      })
+      .catch(() => {
+        // Session expired — clear saved state
+        localStorage.removeItem('visionextract_session');
+      })
+      .finally(() => setIsRestoring(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Save session state to localStorage whenever key values change */
+  useEffect(() => {
+    if (!sessionId) return;
+    localStorage.setItem('visionextract_session', JSON.stringify({
+      sessionId,
+      filename,
+      totalPages,
+      currentPage,
+    }));
+  }, [sessionId, filename, totalPages, currentPage]);
+
 
   const startResizing = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -84,6 +148,14 @@ const App: React.FC = () => {
     try {
       const response = await axios.post(`${API_BASE}/upload`, formData);
       setSession(response.data.session_id, response.data.total_pages);
+      setPdfUrl(null); // new upload always uses File object
+      // Persist session for reload recovery
+      localStorage.setItem('visionextract_session', JSON.stringify({
+        sessionId: response.data.session_id,
+        filename:  uploadedFile.name,
+        totalPages: response.data.total_pages,
+        currentPage: 1,
+      }));
       processCurrentPage(response.data.session_id, 1);
     } catch (error) {
       console.error('Upload failed', error);
@@ -101,10 +173,33 @@ const App: React.FC = () => {
         width: response.data.width,
         height: response.data.height,
       });
+      return response.data.detections;
     } catch (error) {
       console.error('Processing failed', error);
+      return [];
     } finally {
       setLoading(false);
+    }
+  };
+
+  /**
+   * Called by AssetPreviewModal when the user reaches the end of loaded assets
+   * and wants to load a specific page that hasn't been processed yet.
+   * Fetches without changing the visible PDF page in the main viewer.
+   */
+  const fetchPageForPreview = async (pageNum: number) => {
+    if (!sessionId) return [];
+    if (isPageInCache(pageNum)) {
+      // Already cached — return existing data for current page sync
+      return detectionsByPage[pageNum] ?? [];
+    }
+    try {
+      const response = await axios.get(`${API_BASE}/process-page/${sessionId}/${pageNum}`);
+      addPageToCache(pageNum, response.data.detections);
+      return response.data.detections as Detection[];
+    } catch (error) {
+      console.error(`Failed to fetch page ${pageNum} for preview`, error);
+      throw error;
     }
   };
 
@@ -113,6 +208,62 @@ const App: React.FC = () => {
       processCurrentPage(sessionId, currentPage);
     }
   }, [currentPage]);
+
+  /**
+   * Monitor background processing and proactively populate the cache.
+   * Uses refs to avoid stale closures in the setInterval callback.
+   */
+  const lastFetchedRef = useRef(0);
+  const hasSeenBgRef   = useRef(false);
+
+  useEffect(() => {
+    if (!sessionId || isExporting) return;
+    lastFetchedRef.current  = 0;
+    hasSeenBgRef.current    = false;
+
+    const interval = setInterval(async () => {
+      try {
+        const res  = await axios.get(`${API_BASE}/export-status/${sessionId}`);
+        const data = res.data as { current: number; total: number; status: string };
+
+        if (data.status === 'background_processing') {
+          hasSeenBgRef.current = true;
+          setBackgroundProgress(data);
+
+          // Fetch detections for each newly finished page
+          for (let p = lastFetchedRef.current + 1; p <= data.current; p++) {
+            try {
+              const dets = await fetchPageForPreview(p);
+              // If this page is the one the user is currently viewing, push it live
+              if (p === currentPage && dets && dets.length > 0) {
+                setDetections(dets, { width: pageDimensions.width, height: pageDimensions.height });
+              }
+            } catch { /* ignore individual page errors */ }
+          }
+          lastFetchedRef.current = data.current;
+
+        } else if (data.status === 'idle' && hasSeenBgRef.current) {
+          // Background finished — sweep any remaining uncached pages
+          setBackgroundProgress(null);
+          clearInterval(interval);
+
+          for (let p = lastFetchedRef.current + 1; p <= totalPages; p++) {
+            try {
+              const dets = await fetchPageForPreview(p);
+              if (p === currentPage && dets && dets.length > 0) {
+                setDetections(dets, { width: pageDimensions.width, height: pageDimensions.height });
+              }
+            } catch { /* ignore */ }
+          }
+        }
+      } catch (err) {
+        console.error('Background status check failed', err);
+      }
+    }, 1500);
+
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, isExporting, totalPages]);
 
   const goToNextPage = () => {
     if (currentPage < totalPages) setCurrentPage(currentPage + 1);
@@ -170,6 +321,21 @@ const App: React.FC = () => {
 
   return (
     <div className="app-shell">
+      {/* Restore overlay — shown on page reload while session is being recovered */}
+      {isRestoring && (
+        <div className="upload-overlay">
+          <div className="upload-card">
+            <Loader2 className="w-10 h-10 text-indigo-400 animate-spin" />
+            <div style={{ textAlign: 'center' }}>
+              <p className="font-bold text-white text-base mb-1">Restoring Session</p>
+              <p className="text-sm" style={{ color: 'hsl(220,10%,55%)' }}>
+                {filename || 'Loading your previous work…'}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Upload progress overlay */}
       {isUploading && (
         <div className="upload-overlay">
@@ -316,6 +482,14 @@ const App: React.FC = () => {
             <input type="file" className="hidden" accept=".pdf" onChange={handleUpload} />
           </label>
         )}
+
+        {/* Background processing indicator */}
+        {backgroundProgress && (
+          <div className="background-progress-tag">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>AI Analyzing: {backgroundProgress.current}/{backgroundProgress.total}</span>
+          </div>
+        )}
       </header>
 
       {/* ── Main ── */}
@@ -324,7 +498,7 @@ const App: React.FC = () => {
           <>
             {/* PDF panel */}
             <div className="pdf-panel">
-              <PdfViewer file={file} />
+              <PdfViewer file={pdfUrl ?? file} />
             </div>
 
             {/* Resize handle */}
@@ -338,7 +512,10 @@ const App: React.FC = () => {
               className="asset-panel"
               style={{ width: assetPanelWidth, minWidth: 300, flex: 'none' }}
             >
-              <AssetList />
+              <AssetList
+                onFetchPage={fetchPageForPreview}
+                onNavigateToPage={(page) => setCurrentPage(page)}
+              />
             </div>
           </>
         ) : (

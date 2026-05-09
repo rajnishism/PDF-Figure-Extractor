@@ -2,7 +2,7 @@ import os
 import uuid
 import shutil
 import asyncio
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -35,9 +35,30 @@ app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 # Processor instance
 processor = PDFProcessor(UPLOAD_DIR, ASSETS_DIR)
 
-# Global store for export progress
+# Global store for progress (export and background processing)
 # Format: { session_id: { "current": int, "total": int, "status": str } }
 export_progress = {}
+
+def background_process_all_pages(session_id: str, file_path: str, total_pages: int):
+    """Background task: scan every page and cache results to disk.
+    
+    Each page is processed with the full fast pipeline (PyMuPDF-Layout + CV)
+    and saved to uploads/<session_id>/page_N.json. Export reads from this cache
+    and completes instantly without re-processing.
+    """
+    print(f"\n[background] Scanning {total_pages} pages for session {session_id[:8]}")
+    export_progress[session_id] = {"current": 0, "total": total_pages, "status": "background_processing"}
+
+    for page_no in range(1, total_pages + 1):
+        try:
+            processor.process_page(file_path, session_id, page_no)
+            export_progress[session_id]["current"] = page_no
+            print(f"[background] page {page_no}/{total_pages}", end="\r", flush=True)
+        except Exception as e:
+            print(f"\n[background] Error on page {page_no}: {e}")
+
+    export_progress[session_id]["status"] = "idle"
+    print(f"\n[background] Done — all pages cached for session {session_id[:8]}")
 
 class Detection(BaseModel):
     id: str
@@ -65,7 +86,7 @@ class ExportRequest(BaseModel):
     zip_name: Optional[str] = "extracted_assets"
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
@@ -78,12 +99,59 @@ async def upload_pdf(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
     
     total_pages = processor.get_total_pages(file_path)
-    
+
+    # Write metadata so session can be restored after page reload
+    meta = {"filename": file.filename, "total_pages": total_pages}
+    with open(os.path.join(session_dir, "meta.json"), "w") as f:
+        import json; json.dump(meta, f)
+
+    # Start background rendering
+    background_tasks.add_task(background_process_all_pages, session_id, file_path, total_pages)
+
     return {
         "session_id": session_id,
         "total_pages": total_pages,
         "filename": file.filename
     }
+
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    """Validate a session and return its metadata — used for page-reload recovery."""
+    import json
+    session_dir = os.path.join(UPLOAD_DIR, session_id)
+    meta_path   = os.path.join(session_dir, "meta.json")
+    pdf_path    = os.path.join(session_dir, "document.pdf")
+
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+    total_pages   = meta.get("total_pages") or processor.get_total_pages(pdf_path)
+    cached_pages  = [
+        int(fn.replace("page_", "").replace(".json", ""))
+        for fn in os.listdir(session_dir)
+        if fn.startswith("page_") and fn.endswith(".json")
+    ]
+
+    return {
+        "session_id": session_id,
+        "total_pages": total_pages,
+        "filename": meta.get("filename", "document.pdf"),
+        "cached_pages": sorted(cached_pages),
+    }
+
+@app.get("/pdf/{session_id}")
+async def serve_pdf(session_id: str):
+    """Serve the original PDF so PdfViewer can load it via URL after a page reload."""
+    from fastapi.responses import FileResponse
+    pdf_path = os.path.join(UPLOAD_DIR, session_id, "document.pdf")
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF not found")
+    return FileResponse(pdf_path, media_type="application/pdf")
 
 @app.get("/process-page/{session_id}/{page_no}", response_model=PageResponse)
 async def process_page(session_id: str, page_no: int):

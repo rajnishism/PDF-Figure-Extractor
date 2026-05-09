@@ -32,6 +32,14 @@ import numpy as np
 from PIL import Image
 import imagehash
 
+# PyMuPDF-Layout detector (GNN-based, fast ONNX inference)
+try:
+    from pymupdf_layout_detector import detect_layout as _pm_detect_layout
+    _PM_AVAILABLE = True
+except ImportError:
+    _PM_AVAILABLE = False
+    def _pm_detect_layout(*args, **kwargs): return []
+
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
 
@@ -84,11 +92,27 @@ class PDFProcessor:
         doc.close()
         return n
 
-    def process_page(self, file_path: str, session_id: str, page_no: int) -> dict:
+    def _get_cache_path(self, session_id: str, page_no: int) -> str:
+        """Path to the cached JSON result for a single page."""
+        return os.path.join(self.upload_dir, session_id, f"page_{page_no}.json")
+
+    def process_page(self, file_path: str, session_id: str, page_no: int,
+                     force: bool = False) -> dict:
         """
-        Full hybrid pipeline for a single page.
+        Full detection pipeline for a single page.
+        Results are cached to disk on first run and served instantly on repeat calls.
         Returns {detections, width, height}.
         """
+        import json
+        cache_path = self._get_cache_path(session_id, page_no)
+
+        if not force and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass  # corrupted cache — re-process
+
         doc = fitz.open(file_path)
         page = doc.load_page(page_no - 1)
         page_w = page.rect.width
@@ -102,12 +126,19 @@ class PDFProcessor:
         if pix.n == 4:
             img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB)
 
-        # ── Stage 2: collect candidate regions from ALL three detectors ──────
-        # Priority: table_detect (vector lines) > pdf_object > cv_region
+        # ── Stage 2: collect regions from fast detectors ─────────────────────
+        # Tier 0a: PyMuPDF vector-grid tables  (authoritative, no ML)
+        # Tier 0b: PyMuPDF-Layout GNN          (ONNX, ~150ms, high accuracy)
+        # Tier 1 : PDF embedded XObjects       (fast, accurate for rasters)
+        # Tier 2 : OpenCV contour fallback     (catches vector diagrams)
+        table_regions = self._table_regions(page)
+        pm_regions    = _pm_detect_layout(page)
         pdf_regions   = self._pdf_object_regions(page, page_no)
-        table_regions = self._table_regions(page)               # NEW: PyMuPDF grid analysis
         cv_regions    = self._cv_region_detection(img_np, zoom, page_w, page_h)
-        all_regions   = self._merge_region_lists(table_regions, pdf_regions, cv_regions, page_w, page_h)
+
+        all_regions = self._merge_region_lists(
+            table_regions, pm_regions, pdf_regions, cv_regions, page_w, page_h
+        )
 
         # ── Stage 3 & 4: positional + text-coverage filter ───────────────
         filtered = self._apply_position_filter(all_regions, page_w, page_h)
@@ -147,7 +178,16 @@ class PDFProcessor:
         detections  = self._filter_repeated_images(detections, session_id, total_pages)
 
         doc.close()
-        return {"detections": detections, "width": page_w, "height": page_h}
+        res = {"detections": detections, "width": page_w, "height": page_h}
+        
+        # Save to disk cache
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(res, f)
+        except Exception as e:
+            print(f"[cache] Failed to save cache for page {page_no}: {e}")
+
+        return res
 
     def create_page_zip(self, session_id: str, page_no: int) -> str:
         """Legacy single-page zip (kept for API compatibility)."""
@@ -296,40 +336,41 @@ class PDFProcessor:
     def _merge_region_lists(
         self,
         table_regions: list,
+        pm_regions:    list,
         pdf_regions:   list,
         cv_regions:    list,
         page_w: float,
         page_h: float,
     ) -> list[dict]:
         """
-        Three-tier merge with strict priority:
+        Four-tier merge with strict IoU-based deduplication:
 
-          Tier 1 – table_detect (PyMuPDF vector-line grid analysis)
-            Highest confidence. Added unconditionally.
-
-          Tier 2 – pdf_object (embedded image XObjects)
-            High confidence. Added if it doesn't substantially
-            overlap a Tier 1 region (IoU > 0.4).
-
-          Tier 3 – cv_region (render-based contour detection)
-            Lowest confidence — catches vector diagrams not in Tiers 1/2.
-            Added only if IoU < 0.3 with anything already accepted.
+          Tier 0a – table_detect  PyMuPDF vector-line grid (authoritative, no ML)
+          Tier 0b – pymupdf_layout  GNN-based ONNX layout detection (~150ms)
+          Tier 1  – pdf_object   Embedded XObjects (reliable raster detection)
+          Tier 2  – cv_region    OpenCV contour fallback for vector diagrams
         """
         merged: list[dict] = []
 
-        # ─ Tier 1: table detections (authoritative) ─
+        # ─ Tier 0a: PyMuPDF table detector ─
         for r in table_regions:
             merged.append(r)
 
         existing = [r["bbox"] for r in merged]
 
-        # ─ Tier 2: PDF image objects ─
+        # ─ Tier 0b: PyMuPDF-Layout GNN ─
+        for r in pm_regions:
+            if not any(self._iou(r["bbox"], eb) > 0.4 for eb in existing):
+                merged.append(r)
+                existing.append(r["bbox"])
+
+        # ─ Tier 1: PDF embedded XObjects ─
         for r in pdf_regions:
             if not any(self._iou(r["bbox"], eb) > 0.4 for eb in existing):
                 merged.append(r)
                 existing.append(r["bbox"])
 
-        # ─ Tier 3: CV regions (fill gaps for vector diagrams) ─
+        # ─ Tier 2: OpenCV contour fallback ─
         for r in cv_regions:
             if not any(self._iou(r["bbox"], eb) > 0.3 for eb in existing):
                 merged.append(r)
@@ -408,10 +449,11 @@ class PDFProcessor:
         """
         keep = []
         for r in regions:
-            # ─ Trust the PDF's own image object table and the table detector ─
-            # table_detect regions are inherently text-dense (cell content) and
-            # would be wrongly rejected by the text-coverage gate.
-            if r.get("source") in ("pdf_object", "table_detect"):
+            # ─ Trust authoritative sources — never apply text-coverage filter to these:
+            #   • table_detect: tables ARE text-dense by definition
+            #   • pdf_object:   the PDF itself declared an XObject here
+            #   • pymupdf_layout: GNN layout model already classified it
+            if r.get("source") in ("pdf_object", "table_detect", "pymupdf_layout"):
                 keep.append(r)
                 continue
             coverage = self._compute_text_coverage(page, r["bbox"])
@@ -433,7 +475,8 @@ class PDFProcessor:
         """
         keep = []
         for r in regions:
-            if r.get("source") == "pdf_object":
+            # Authoritative sources already know what they found — don't refilter
+            if r.get("source") in ("pdf_object", "table_detect", "pymupdf_layout"):
                 keep.append(r)
                 continue
             x0, y0, x1, y1 = r["bbox"]
@@ -807,7 +850,7 @@ class PDFProcessor:
 
         # ── Fast path: definitive detections ──────────────────────────────
         if has_figno and pos == "above":
-            if source in ("table_detect", "pdf_object"):
+            if source in ("table_detect", "pdf_object", "pymupdf_layout"):
                 return 1.0   # Tier A: authoritative source + labeled caption above
             return 0.95      # Tier B: cv_region with clear above-caption label
 
@@ -823,6 +866,8 @@ class PDFProcessor:
         # Source reliability
         if source == "table_detect":
             score += 0.15   # find_tables() is authoritative
+        elif source == "pymupdf_layout":
+            score += 0.12   # PyMuPDF GNN is reliable
         elif source == "pdf_object":
             score += 0.10   # embedded XObject is reliable
         # cv_region: no bonus
